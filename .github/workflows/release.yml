@@ -21,6 +21,7 @@ jobs:
       - name: get .exe
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.release.tag_name }}
           files: target/release/uk-layout-switcher.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

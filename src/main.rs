@@ -12,7 +12,7 @@ use std::{fs, thread, time};
 use std::io::Write;
 
 // === ІМПОРТИ ДЛЯ ХУКУ ===
-use rdev::{listen, Event, EventType, Key as RdevKey};
+use rdev::{listen, Event as RdevEvent, EventType, Key as RdevKey};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 
@@ -20,6 +20,11 @@ use std::sync::Mutex;
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SendMessageW, WM_INPUTLANGCHANGEREQUEST};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ActivateKeyboardLayout, GetKeyboardLayout, GetKeyboardLayoutList, HKL, KLF_SETFORPROCESS};
 use windows::Win32::Foundation::{LPARAM, WPARAM};
+
+// === ІМПОРТИ ДЛЯ ОДНОГО ЕКЗЕМПЛЯРУ ТА ЗВУКУ ===
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::Foundation::GetLastError;
+use windows::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_ASYNC};
 
 // === ГЛОБАЛЬНИЙ СТАН ===
 static TYPED_BUFFER: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
@@ -30,17 +35,29 @@ static LAST_ACTIVE_HWND: Lazy<Mutex<isize>> = Lazy::new(|| Mutex::new(0));
 const MAX_BUFFER_LEN: usize = 100;
 // =========================
 
+// ВИПРАВЛЕНО: Додано serde(default), щоб старі конфіги не ламали програму
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Config {
+    #[serde(default = "default_lang")]
     current_lang: String,
+    #[serde(default)]
     auto_start: bool,
-    remap_capslock: bool, // НОВЕ: стан ремапу CapsLock
+    #[serde(default)]
+    remap_capslock: bool,
+    #[serde(default = "default_sound_enabled")]
+    sound_enabled: bool,
 }
 
+fn default_lang() -> String { "EN".into() }
+fn default_sound_enabled() -> bool { true }
+
 const APP_NAME: &str = "UK Layout Switcher";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const SWITCH_SOUND_BYTES: &[u8] = include_bytes!("../assets/switch.wav");
 
 // === ФУНКЦІЯ ХУКУ КЛАВІАТУРИ ===
-fn keyboard_callback(event: Event) {
+fn keyboard_callback(event: RdevEvent) {
     if *IS_CONVERTING.lock().unwrap() {
         return;
     }
@@ -117,25 +134,34 @@ fn keyboard_callback(event: Event) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // --- ПЕРЕВІРКА НА ОДИН ЕКЗЕМПЛЯР ---
+    unsafe {
+        let _mutex = CreateMutexW(None, false, windows::core::w!("Local\\UK_Switcher_Mutex"));
+        if GetLastError().0 == 183 { // ERROR_ALREADY_EXISTS
+            std::process::exit(0);
+        }
+    }
+
     std::thread::spawn(|| {
         if let Err(error) = listen(keyboard_callback) {
             log_error(&format!("Помилка слухача клавіатури: {:?}", error));
         }
     });
 
-    let config_dir = dirs::config_dir().unwrap().join("uk-switcher");
-    fs::create_dir_all(&config_dir)?;
+    let config_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| dirs::config_dir().unwrap().join("uk-switcher"));
+        
     let config_path = config_dir.join("config.json");
 
     let mut config: Config = if config_path.exists() {
         serde_json::from_slice(&fs::read(&config_path)?)
-            .unwrap_or(Config { current_lang: "EN".into(), auto_start: false, remap_capslock: false })
+            .unwrap_or(Config { current_lang: "EN".into(), auto_start: false, remap_capslock: false, sound_enabled: true })
     } else {
-        Config { current_lang: "EN".into(), auto_start: false, remap_capslock: false }
+        Config { current_lang: "EN".into(), auto_start: false, remap_capslock: false, sound_enabled: true }
     };
 
-    // ВАЖЛИВО: Синхронізуємо стан ремапу з реєстром Windows
-    // Реєстр — це джерело правди для ОС, тому довіряємо йому більше, ніж config.json
     config.remap_capslock = get_capslock_remap_status();
 
     if config.auto_start {
@@ -151,13 +177,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let icon_ua = load_tray_icon(icon_ua_bytes);
 
     let tray_menu = Menu::new();
+    
+    let title_item = MenuItem::new(format!("UK Layout Switcher v{}", APP_VERSION), false, None);
     let auto_start_item = CheckMenuItem::new("Запускати з Windows", true, config.auto_start, None);
-    // НОВЕ: Пункт меню для ремапу
+    let sound_item = CheckMenuItem::new("Звук перемикання", true, config.sound_enabled, None);
     let remap_item = CheckMenuItem::new("Remap CapsLock -> F24 (Req. Admin)", true, config.remap_capslock, None);
     let quit_item = MenuItem::new("Вийти", true, None);
 
+    tray_menu.append(&title_item)?;
     tray_menu.append(&auto_start_item)?;
-    tray_menu.append(&remap_item)?; // Додано в меню
+    tray_menu.append(&sound_item)?;
+    tray_menu.append(&remap_item)?;
     tray_menu.append(&quit_item)?;
 
     let mut tray = TrayIconBuilder::new()
@@ -170,23 +200,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hotkey = HotKey::new(None, Code::F24);
     
     if let Err(e) = manager.register(hotkey) {
-        eprintln!("Не вдалося зареєструвати F24: {e}");
+        log_error(&format!("Не вдалося зареєструвати F24: {e}"));
     }
 
     let quit_id = quit_item.id().clone();
     let auto_start_id = auto_start_item.id().clone();
-    let remap_id = remap_item.id().clone(); // НОВЕ
+    let sound_id = sound_item.id().clone();
+    let remap_id = remap_item.id().clone();
 
     let hotkey_receiver = GlobalHotKeyEvent::receiver();
     let tray_receiver = TrayIconEvent::receiver();
+    let menu_receiver = MenuEvent::receiver();
 
     const DEBOUNCE_MS: u64 = 300;
     let mut last_action = time::Instant::now() - time::Duration::from_millis(DEBOUNCE_MS + 10);
     let mut last_lang_check = time::Instant::now();
 
     let event_loop = EventLoopBuilder::new().build();
+    
+    // ВИПРАВЛЕНО: Зберігаємо manager у змінну, яка захоплюється замиканням, щоб її не видалило з пам'яті
+    let _manager = manager;
+    
     event_loop.run(move |_, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(time::Instant::now() + time::Duration::from_millis(30));
+        let _ = &_manager; // Тримаємо менеджер у пам'яті
 
         if last_lang_check.elapsed() >= time::Duration::from_millis(500) {
             last_lang_check = time::Instant::now();
@@ -214,7 +251,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if last_action.elapsed() >= time::Duration::from_millis(DEBOUNCE_MS) {
                     last_action = time::Instant::now();
                     *IS_CONVERTING.lock().unwrap() = true;
-                    let _ = toggle_and_convert(&mut config, &mut tray, &icon_en, &icon_ua);
+                    
+                    if let Err(e) = toggle_and_convert(&mut config, &mut tray, &icon_en, &icon_ua) {
+                        log_error(&format!("Помилка конвертації: {:?}", e));
+                    }
+                    
                     *IS_CONVERTING.lock().unwrap() = false;
                 }
             }
@@ -224,13 +265,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
                 if last_action.elapsed() >= time::Duration::from_millis(DEBOUNCE_MS) {
                     last_action = time::Instant::now();
-                    let _ = toggle_layout_only(&mut config, &mut tray, &icon_en, &icon_ua);
+                    *IS_CONVERTING.lock().unwrap() = true;
+                    
+                    if let Err(e) = toggle_layout_only(&mut config, &mut tray, &icon_en, &icon_ua) {
+                        log_error(&format!("Помилка перемикання: {:?}", e));
+                    }
+                    
+                    *IS_CONVERTING.lock().unwrap() = false;
                 }
             }
         }
 
-        if let Ok(event) = MenuEvent::receiver().try_recv() {
+        if let Ok(event) = menu_receiver.try_recv() {
             if event.id == quit_id {
+                let _ = tray.set_visible(false);
                 std::process::exit(0);
             } else if event.id == auto_start_id {
                 config.auto_start = !config.auto_start;
@@ -239,11 +287,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     log_error(&format!("Не вдалося змінити автозапуск: {e}"));
                 }
                 let _ = save_config(&config);
-            } else if event.id == remap_id { // НОВЕ: Обробка ремапу
+            } else if event.id == sound_id {
+                config.sound_enabled = !config.sound_enabled;
+                let _ = sound_item.set_checked(config.sound_enabled);
+                let _ = save_config(&config);
+            } else if event.id == remap_id {
                 let new_state = !config.remap_capslock;
                 if let Err(e) = set_capslock_remap(new_state) {
                     log_error(&format!("Помилка зміни Scancode Map (потрібні права Адміна?): {e}"));
-                    // Якщо помилка (немає прав), повертаємо галочку назад
                     let _ = remap_item.set_checked(config.remap_capslock);
                 } else {
                     config.remap_capslock = new_state;
@@ -267,7 +318,6 @@ fn set_auto_start(enable: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// ФУНКЦІЯ: Ремап CapsLock -> F24 (Сирий WinAPI)
 fn set_capslock_remap(enable: bool) -> Result<(), Box<dyn std::error::Error>> {
     use windows::Win32::System::Registry::*;
     use windows::Win32::Foundation::ERROR_SUCCESS;
@@ -279,7 +329,6 @@ fn set_capslock_remap(enable: bool) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         let mut h_key = Default::default();
         
-        // Відкриваємо ключ реєстру з правами запису
         let open_result = RegOpenKeyExW(
             HKEY_LOCAL_MACHINE,
             PCWSTR(key_path.as_ptr()),
@@ -315,7 +364,7 @@ fn set_capslock_remap(enable: bool) -> Result<(), Box<dyn std::error::Error>> {
             }
         } else {
             let del_result = RegDeleteValueW(h_key, PCWSTR(value_name.as_ptr()));
-            if del_result != ERROR_SUCCESS && del_result.0 != 2 { // Код 2 = значення не існує, це не помилка
+            if del_result != ERROR_SUCCESS && del_result.0 != 2 {
                 let _ = RegCloseKey(h_key);
                 return Err(format!("Не вдалося видалити значення (код {})", del_result.0).into());
             }
@@ -330,16 +379,48 @@ fn set_capslock_remap(enable: bool) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn log_error(msg: &str) {
-    let Some(config_dir) = dirs::config_dir() else { return };
-    let log_path = config_dir.join("uk-switcher").join("error.log");
-    let _ = fs::create_dir_all(log_path.parent().unwrap());
     let timestamp = time::SystemTime::now().duration_since(time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let log_line = format!("[{timestamp}] {msg}\n");
+    
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            let log_path = parent.join("error.log");
+            if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                let _ = file.write_all(log_line.as_bytes());
+                return;
+            }
+        }
+    }
+    
+    if let Some(config_dir) = dirs::config_dir() {
+        let log_dir = config_dir.join("uk-switcher");
+        let _ = fs::create_dir_all(&log_dir);
+        let log_path = log_dir.join("error.log");
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            let _ = file.write_all(log_line.as_bytes());
+            return;
+        }
+    }
+    
+    let log_path = std::env::temp_dir().join("uk_switcher_error.log");
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-        let _ = writeln!(file, "[{timestamp}] {msg}");
+        let _ = file.write_all(log_line.as_bytes());
     }
 }
 
 // ====================== ОСНОВНІ ФУНКЦІЇ ======================
+
+fn play_switch_sound(config: &Config) {
+    if config.sound_enabled {
+        unsafe {
+            let _ = PlaySoundW(
+                windows::core::PCWSTR(SWITCH_SOUND_BYTES.as_ptr() as *const _),
+                None,
+                SND_MEMORY | SND_ASYNC,
+            );
+        }
+    }
+}
 
 fn toggle_layout_only(
     config: &mut Config,
@@ -350,6 +431,7 @@ fn toggle_layout_only(
     config.current_lang = get_current_os_lang();
     config.current_lang = if config.current_lang == "EN" { "UA" } else { "EN" }.to_string();
     switch_system_layout_silent(&config.current_lang);
+    play_switch_sound(config);
     let _ = tray.set_icon(Some(if config.current_lang == "EN" { icon_en.clone() } else { icon_ua.clone() }));
     let _ = tray.set_tooltip(Some(&format!("UK Switcher — {}", config.current_lang)));
     let _ = save_config(config);
@@ -365,7 +447,6 @@ fn toggle_and_convert(
     let mut clipboard = Clipboard::new()?;
     let mut enigo = Enigo::new(&Settings::default())?;
 
-    // 1. ОТРИМУЄМО СЛОВО З ХУКА ТА ОЧИЩАЄМО БУФЕР ОДРАЗУ
     let last_word_data = get_last_word_from_buffer();
     TYPED_BUFFER.lock().unwrap().clear();
 
@@ -377,46 +458,44 @@ fn toggle_and_convert(
             let to_ua = original_os_lang == "EN";
             let mut converted = convert_text(&word, to_ua);
 
-            let spaces_to_add = delete_count - word.chars().count();
+            let spaces_to_add = delete_count.saturating_sub(word.chars().count());
             for _ in 0..spaces_to_add {
                 converted.push(' ');
             }
 
             let saved_clipboard = clipboard.get_text().ok().filter(|s| !s.is_empty());
             clipboard.set_text(&converted)?;
-            thread::sleep(time::Duration::from_millis(10)); // 50 / 4 = 12.5 -> 10
-            thread::sleep(time::Duration::from_millis(20)); // 80 / 4 = 20
+            thread::sleep(time::Duration::from_millis(10));
+            thread::sleep(time::Duration::from_millis(20));
 
-            // Видаляємо символи (слово + пробіли)
             for _ in 0..delete_count {
                 enigo.key(Key::Backspace, enigo::Direction::Press)?;
-                thread::sleep(time::Duration::from_millis(10)); // 40 / 4 = 10
+                thread::sleep(time::Duration::from_millis(10));
                 enigo.key(Key::Backspace, enigo::Direction::Release)?;
-                thread::sleep(time::Duration::from_millis(10)); // 40 / 4 = 10
+                thread::sleep(time::Duration::from_millis(10));
             }
-            thread::sleep(time::Duration::from_millis(20)); // 80 / 4 = 20
+            thread::sleep(time::Duration::from_millis(20));
 
-            // Вставляємо текст з повернутими пробілами
             enigo.key(Key::Control, enigo::Direction::Press)?;
-            thread::sleep(time::Duration::from_millis(10)); // 50 / 4 = 12.5 -> 10
+            thread::sleep(time::Duration::from_millis(10));
             enigo.key(Key::V, enigo::Direction::Press)?;
-            thread::sleep(time::Duration::from_millis(5));  // 20 / 4 = 5
+            thread::sleep(time::Duration::from_millis(5));
             enigo.key(Key::V, enigo::Direction::Release)?;
-            thread::sleep(time::Duration::from_millis(5));  // 20 / 4 = 5
+            thread::sleep(time::Duration::from_millis(5));
             enigo.key(Key::Control, enigo::Direction::Release)?;
-            thread::sleep(time::Duration::from_millis(25)); // 100 / 4 = 25
+            thread::sleep(time::Duration::from_millis(25));
 
             if let Some(saved) = saved_clipboard { let _ = clipboard.set_text(&saved); } else { let _ = clipboard.clear(); }
         }
     } else {
         let saved_clipboard = clipboard.get_text().ok().filter(|s| !s.is_empty());
         let _ = clipboard.clear();
-        thread::sleep(time::Duration::from_millis(10)); // 30 / 4 = 7.5 -> 10
+        thread::sleep(time::Duration::from_millis(10));
 
         enigo.key(Key::Control, enigo::Direction::Press)?;
         enigo.key(Key::Insert, enigo::Direction::Click)?;
         enigo.key(Key::Control, enigo::Direction::Release)?;
-        thread::sleep(time::Duration::from_millis(25)); // 100 / 4 = 25
+        thread::sleep(time::Duration::from_millis(25));
 
         let copied_text = clipboard.get_text().unwrap_or_default();
 
@@ -429,19 +508,19 @@ fn toggle_and_convert(
             enigo.key(Key::Control, enigo::Direction::Press)?;
             enigo.key(Key::V, enigo::Direction::Click)?;
             enigo.key(Key::Control, enigo::Direction::Release)?;
-            thread::sleep(time::Duration::from_millis(25)); // 100 / 4 = 25
+            thread::sleep(time::Duration::from_millis(25));
         }
 
         if let Some(saved) = saved_clipboard { let _ = clipboard.set_text(&saved); } else { let _ = clipboard.clear(); }
     }
 
-    // Перемикаємо розкладку
     switch_system_layout_silent(&config.current_lang);
+    play_switch_sound(config);
     let _ = tray.set_icon(Some(if config.current_lang == "EN" { icon_en.clone() } else { icon_ua.clone() }));
     let _ = tray.set_tooltip(Some(&format!("UK Switcher — {}", config.current_lang)));
     let _ = save_config(config);
     
-    thread::sleep(time::Duration::from_millis(50)); // 200 / 4 = 50
+    thread::sleep(time::Duration::from_millis(50));
     Ok(())
 }
 
@@ -451,7 +530,6 @@ fn get_last_word_from_buffer() -> Option<(String, usize)> {
         return None;
     }
 
-    // Кількість символів до обробки
     let original_chars = buffer.chars().count();
 
     let trimmed = buffer.trim_end();
@@ -460,17 +538,13 @@ fn get_last_word_from_buffer() -> Option<(String, usize)> {
         return None;
     }
 
-    // Шукаємо початок останнього слова
     let word_start = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
     let last_word = trimmed[word_start..].to_string();
 
-    // Очищаємо буфер від цього слова ТА пробілів після нього
     *buffer = buffer[..word_start].to_string();
 
-    // Кількість символів, яку потрібно видалити (слово + пробіли після нього)
     let delete_count = original_chars - buffer.chars().count();
 
-    // Повертаємо і слово, і кількість символів для видалення
     Some((last_word, delete_count))
 }
 
@@ -540,7 +614,10 @@ fn detect_conversion_direction(text: &str) -> bool {
 }
 
 fn save_config(config: &Config) -> std::io::Result<()> {
-    let path = dirs::config_dir().unwrap().join("uk-switcher/config.json");
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.join("config.json")))
+        .unwrap_or_else(|| dirs::config_dir().unwrap().join("uk-switcher/config.json"));
     fs::write(path, serde_json::to_string_pretty(config)?)
 }
 
@@ -552,7 +629,6 @@ fn load_tray_icon(bytes: &[u8]) -> Icon {
     Icon::from_rgba(pixels, width, height).expect("Не вдалося створити іконку")
 }
 
-// ФУНКЦІЯ: Перевірка стану ремапу в реєстрі
 fn get_capslock_remap_status() -> bool {
     use windows::Win32::System::Registry::*;
     use windows::Win32::Foundation::ERROR_SUCCESS;
@@ -579,14 +655,13 @@ fn get_capslock_remap_status() -> bool {
         let mut data: [u8; 20] = [0; 20];
         let mut data_len: u32 = 20;
 
-        // Передаємо сирий вказівник на масив та на довжину
         let query_result = RegQueryValueExW(
             h_key,
             PCWSTR(value_name.as_ptr()),
             None,
             None,
-            Some(data.as_mut_ptr()), // Виправлено: сирий вказівник *mut u8
-            Some(&mut data_len as *mut u32), // Виправлено: сирий вказівник *mut u32
+            Some(data.as_mut_ptr()),
+            Some(&mut data_len as *mut u32),
         );
 
         let _ = RegCloseKey(h_key);

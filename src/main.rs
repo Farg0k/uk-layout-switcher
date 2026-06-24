@@ -11,15 +11,21 @@ use winreg::{RegKey, enums::*};
 use std::{fs, thread, time};
 use std::io::Write;
 
-// === ІМПОРТИ ДЛЯ ХУКУ ===
-use rdev::{listen, Event as RdevEvent, EventType, Key as RdevKey};
+// === ІМПОРТИ ДЛЯ РІДНОГО ХУКУ WINDOWS (замість rdev) ===
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
+use windows::Win32::UI::WindowsAndMessaging::{
+    SetWindowsHookExW, UnhookWindowsHookEx, CallNextHookEx, GetMessageW, MSG,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, KBDLLHOOKSTRUCT, HC_ACTION, WM_KEYDOWN, WM_SYSKEYDOWN, 
+    WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN
+};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_SHIFT};
+use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 
 // === ІМПОРТИ ДЛЯ БЕЗШУМНОГО ПЕРЕМИКАННЯ WINAPI ===
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SendMessageW, WM_INPUTLANGCHANGEREQUEST};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ActivateKeyboardLayout, GetKeyboardLayout, GetKeyboardLayoutList, HKL, KLF_SETFORPROCESS};
-use windows::Win32::Foundation::{LPARAM, WPARAM};
 
 // === ІМПОРТИ ДЛЯ ОДНОГО ЕКЗЕМПЛЯРУ ТА ЗВУКУ ===
 use windows::Win32::System::Threading::CreateMutexW;
@@ -29,13 +35,11 @@ use windows::Win32::Media::Audio::{PlaySoundW, SND_MEMORY, SND_ASYNC};
 // === ГЛОБАЛЬНИЙ СТАН ===
 static TYPED_BUFFER: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 static IS_CONVERTING: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
-static SHIFT_PRESSED: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static LAST_ACTIVE_HWND: Lazy<Mutex<isize>> = Lazy::new(|| Mutex::new(0));
 
 const MAX_BUFFER_LEN: usize = 100;
 // =========================
 
-// ВИПРАВЛЕНО: Додано serde(default), щоб старі конфіги не ламали програму
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Config {
     #[serde(default = "default_lang")]
@@ -56,95 +60,119 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const SWITCH_SOUND_BYTES: &[u8] = include_bytes!("../assets/switch.wav");
 
-// === ФУНКЦІЯ ХУКУ КЛАВІАТУРИ ===
-fn keyboard_callback(event: RdevEvent) {
-    if *IS_CONVERTING.lock().unwrap() {
-        return;
+// === ФУНКЦІЇ РІДНОГО ХУКУ ===
+unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let msg = wparam.0 as u32;
+        
+        if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+            if !*IS_CONVERTING.lock().unwrap() {
+                let mut buffer = TYPED_BUFFER.lock().unwrap();
+                let vk = kb.vkCode;
+                
+                // Перевіряємо Shift через WinAPI
+                let shift = GetAsyncKeyState(VK_SHIFT.0 as i32) < 0;
+                
+                match vk {
+                    0x08 => { buffer.pop(); } // Backspace
+                    0x0D | 0x1B => buffer.clear(), // Return | Escape
+                    0x20 => buffer.push(' '), // Space
+                    0x09 => buffer.clear(), // Tab
+                    0x25 | 0x26 | 0x27 | 0x28 => buffer.clear(), // Arrows
+                    0x24 | 0x23 => buffer.clear(), // Home | End
+                    
+                    // A-Z
+                    v if (0x41..=0x5A).contains(&v) => {
+                        let c = (v as u8 as char).to_ascii_lowercase();
+                        buffer.push(if shift { c.to_ascii_uppercase() } else { c });
+                    }
+                    
+                    // 0-9 (верхній ряд)
+                    v if (0x30..=0x39).contains(&v) => {
+                        let idx = (v - 0x30) as usize;
+                        let no_shift = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+                        let with_shift = [')', '!', '@', '#', '$', '%', '^', '&', '*', '('];
+                        buffer.push(if shift { with_shift[idx] } else { no_shift[idx] });
+                    }
+                    
+                    // OEM Спеціальні символи
+                    0xBA => buffer.push(if shift { ':' } else { ';' }),
+                    0xBB => buffer.push(if shift { '+' } else { '=' }),
+                    0xBC => buffer.push(if shift { '<' } else { ',' }),
+                    0xBD => buffer.push(if shift { '_' } else { '-' }),
+                    0xBE => buffer.push(if shift { '>' } else { '.' }),
+                    0xBF => buffer.push(if shift { '?' } else { '/' }),
+                    0xC0 => buffer.push(if shift { '~' } else { '`' }),
+                    0xDB => buffer.push(if shift { '{' } else { '[' }),
+                    0xDC => buffer.push(if shift { '|' } else { '\\' }),
+                    0xDD => buffer.push(if shift { '}' } else { ']' }),
+                    0xDE => buffer.push(if shift { '"' } else { '\'' }),
+                    
+                    // Numpad цифри
+                    0x60..=0x69 => buffer.push(((vk - 0x60) as u8 + b'0') as char),
+                    0x6A => buffer.push('*'),
+                    0x6B => buffer.push('+'),
+                    0x6D => buffer.push('-'),
+                    0x6E => buffer.push('.'),
+                    0x6F => buffer.push('/'),
+                    
+                    _ => {}
+                }
+                
+                if buffer.len() > MAX_BUFFER_LEN {
+                    let drain_count = buffer.len() - MAX_BUFFER_LEN;
+                    buffer.drain(..drain_count);
+                }
+            }
+        }
     }
+    CallNextHookEx(None, code, wparam, lparam)
+}
 
-    match event.event_type {
-        EventType::KeyPress(key) => {
-            let mut buffer = TYPED_BUFFER.lock().unwrap();
-            let shift = *SHIFT_PRESSED.lock().unwrap();
-
-            match key {
-                RdevKey::ShiftLeft | RdevKey::ShiftRight => {
-                    *SHIFT_PRESSED.lock().unwrap() = true;
-                }
-                RdevKey::Space => buffer.push(' '),
-                RdevKey::Backspace => { buffer.pop(); }
-                RdevKey::Return | RdevKey::Escape => buffer.clear(),
-                
-                RdevKey::KeyA => buffer.push(if shift { 'A' } else { 'a' }),
-                RdevKey::KeyB => buffer.push(if shift { 'B' } else { 'b' }),
-                RdevKey::KeyC => buffer.push(if shift { 'C' } else { 'c' }),
-                RdevKey::KeyD => buffer.push(if shift { 'D' } else { 'd' }),
-                RdevKey::KeyE => buffer.push(if shift { 'E' } else { 'e' }),
-                RdevKey::KeyF => buffer.push(if shift { 'F' } else { 'f' }),
-                RdevKey::KeyG => buffer.push(if shift { 'G' } else { 'g' }),
-                RdevKey::KeyH => buffer.push(if shift { 'H' } else { 'h' }),
-                RdevKey::KeyI => buffer.push(if shift { 'I' } else { 'i' }),
-                RdevKey::KeyJ => buffer.push(if shift { 'J' } else { 'j' }),
-                RdevKey::KeyK => buffer.push(if shift { 'K' } else { 'k' }),
-                RdevKey::KeyL => buffer.push(if shift { 'L' } else { 'l' }),
-                RdevKey::KeyM => buffer.push(if shift { 'M' } else { 'm' }),
-                RdevKey::KeyN => buffer.push(if shift { 'N' } else { 'n' }),
-                RdevKey::KeyO => buffer.push(if shift { 'O' } else { 'o' }),
-                RdevKey::KeyP => buffer.push(if shift { 'P' } else { 'p' }),
-                RdevKey::KeyQ => buffer.push(if shift { 'Q' } else { 'q' }),
-                RdevKey::KeyR => buffer.push(if shift { 'R' } else { 'r' }),
-                RdevKey::KeyS => buffer.push(if shift { 'S' } else { 's' }),
-                RdevKey::KeyT => buffer.push(if shift { 'T' } else { 't' }),
-                RdevKey::KeyU => buffer.push(if shift { 'U' } else { 'u' }),
-                RdevKey::KeyV => buffer.push(if shift { 'V' } else { 'v' }),
-                RdevKey::KeyW => buffer.push(if shift { 'W' } else { 'w' }),
-                RdevKey::KeyX => buffer.push(if shift { 'X' } else { 'x' }),
-                RdevKey::KeyY => buffer.push(if shift { 'Y' } else { 'y' }),
-                RdevKey::KeyZ => buffer.push(if shift { 'Z' } else { 'z' }),
-                
-                RdevKey::Comma => buffer.push(if shift { '<' } else { ',' }),
-                RdevKey::Dot => buffer.push(if shift { '>' } else { '.' }),
-                RdevKey::SemiColon => buffer.push(if shift { ':' } else { ';' }),
-                RdevKey::Quote => buffer.push(if shift { '"' } else { '\'' }),
-                RdevKey::LeftBracket => buffer.push(if shift { '{' } else { '[' }),
-                RdevKey::RightBracket => buffer.push(if shift { '}' } else { ']' }),
-
-                RdevKey::Tab | RdevKey::LeftArrow | RdevKey::RightArrow | RdevKey::UpArrow | RdevKey::DownArrow |
-                RdevKey::Home | RdevKey::End | RdevKey::ControlLeft | RdevKey::ControlRight => {
-                    buffer.clear();
-                }
-                _ => {}
-            }
-
-            if buffer.len() > MAX_BUFFER_LEN {
-                let drain_count = buffer.len() - MAX_BUFFER_LEN;
-                buffer.drain(..drain_count);
-            }
-        }
-        EventType::KeyRelease(key) => {
-            if key == RdevKey::ShiftLeft || key == RdevKey::ShiftRight {
-                *SHIFT_PRESSED.lock().unwrap() = false;
-            }
-        }
-        EventType::ButtonPress(_) => {
+unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let msg = wparam.0 as u32;
+        if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN {
             TYPED_BUFFER.lock().unwrap().clear();
         }
-        _ => {}
     }
+    CallNextHookEx(None, code, wparam, lparam)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- ПЕРЕВІРКА НА ОДИН ЕКЗЕМПЛЯР ---
     unsafe {
         let _mutex = CreateMutexW(None, false, windows::core::w!("Local\\UK_Switcher_Mutex"));
-        if GetLastError().0 == 183 { // ERROR_ALREADY_EXISTS
+        if GetLastError().0 == 183 {
             std::process::exit(0);
         }
     }
 
+    // --- ІНІЦІАЛІЗАЦІЯ РІДНИХ ХУКІВ ---
+        // --- ІНІЦІАЛІЗАЦІЯ РІДНИХ ХУКІВ ---
     std::thread::spawn(|| {
-        if let Err(error) = listen(keyboard_callback) {
-            log_error(&format!("Помилка слухача клавіатури: {:?}", error));
+        unsafe {
+            let h_inst = GetModuleHandleW(None).unwrap();
+            let kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), h_inst, 0);
+            let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), h_inst, 0);
+            
+            // ВИПРАВЛЕНО: перевірка помилок та розгортання Result
+            if kb_hook.is_err() || mouse_hook.is_err() {
+                log_error("Не вдалося встановити системні хуки.");
+                return;
+            }
+            
+            let kb_hook = kb_hook.unwrap();
+            let mouse_hook = mouse_hook.unwrap();
+            
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                // Цикл повідомлень тримає хуки активними
+            }
+            
+            let _ = UnhookWindowsHookEx(kb_hook);
+            let _ = UnhookWindowsHookEx(mouse_hook);
         }
     });
 
@@ -217,13 +245,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_lang_check = time::Instant::now();
 
     let event_loop = EventLoopBuilder::new().build();
-    
-    // ВИПРАВЛЕНО: Зберігаємо manager у змінну, яка захоплюється замиканням, щоб її не видалило з пам'яті
     let _manager = manager;
     
     event_loop.run(move |_, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(time::Instant::now() + time::Duration::from_millis(30));
-        let _ = &_manager; // Тримаємо менеджер у пам'яті
+        let _ = &_manager;
 
         if last_lang_check.elapsed() >= time::Duration::from_millis(500) {
             last_lang_check = time::Instant::now();
@@ -422,6 +448,18 @@ fn play_switch_sound(config: &Config) {
     }
 }
 
+fn spawn_clipboard_restore(saved: Option<String>) {
+    thread::spawn(move || {
+        thread::sleep(time::Duration::from_millis(450));
+        if let Ok(mut cb) = Clipboard::new() {
+            match saved {
+                Some(text) => { let _ = cb.set_text(&text); }
+                None => { let _ = cb.clear(); }
+            }
+        }
+    });
+}
+
 fn toggle_layout_only(
     config: &mut Config,
     tray: &mut tray_icon::TrayIcon,
@@ -447,6 +485,11 @@ fn toggle_and_convert(
     let mut clipboard = Clipboard::new()?;
     let mut enigo = Enigo::new(&Settings::default())?;
 
+    // --- ДРУК БУФЕРУ В ЛОГ ---
+    let buffer_content = TYPED_BUFFER.lock().unwrap().clone();
+    log_error(&format!("--- НАТИСК CapsLock ---"));
+    log_error(&format!("Вміст буфера: [{}]", buffer_content));
+
     let last_word_data = get_last_word_from_buffer();
     TYPED_BUFFER.lock().unwrap().clear();
 
@@ -454,6 +497,8 @@ fn toggle_and_convert(
     config.current_lang = if original_os_lang == "EN" { "UA" } else { "EN" }.to_string();
 
     if let Some((word, delete_count)) = last_word_data {
+        log_error(&format!("Знайдено слово: [{}], Видалити символів: {}", word, delete_count));
+        
         if !word.is_empty() {
             let to_ua = original_os_lang == "EN";
             let mut converted = convert_text(&word, to_ua);
@@ -485,11 +530,15 @@ fn toggle_and_convert(
             enigo.key(Key::Control, enigo::Direction::Release)?;
             thread::sleep(time::Duration::from_millis(25));
 
-            if let Some(saved) = saved_clipboard { let _ = clipboard.set_text(&saved); } else { let _ = clipboard.clear(); }
+            spawn_clipboard_restore(saved_clipboard);
         }
     } else {
+        log_error("Буфер порожній. Спроба конвертації виділеного тексту.");
+        
+        let marker = "___UK_SWITCHER_EMPTY_MARKER___";
         let saved_clipboard = clipboard.get_text().ok().filter(|s| !s.is_empty());
-        let _ = clipboard.clear();
+        
+        let _ = clipboard.set_text(marker);
         thread::sleep(time::Duration::from_millis(10));
 
         enigo.key(Key::Control, enigo::Direction::Press)?;
@@ -499,7 +548,7 @@ fn toggle_and_convert(
 
         let copied_text = clipboard.get_text().unwrap_or_default();
 
-        if !copied_text.is_empty() {
+        if !copied_text.is_empty() && copied_text != marker {
             let cleaned_text = copied_text.trim_end_matches(|c| c == '\r' || c == '\n').to_string();
             let to_ua = detect_conversion_direction(&cleaned_text);
             let converted = convert_text(&cleaned_text, to_ua);
@@ -511,7 +560,7 @@ fn toggle_and_convert(
             thread::sleep(time::Duration::from_millis(25));
         }
 
-        if let Some(saved) = saved_clipboard { let _ = clipboard.set_text(&saved); } else { let _ = clipboard.clear(); }
+        spawn_clipboard_restore(saved_clipboard);
     }
 
     switch_system_layout_silent(&config.current_lang);

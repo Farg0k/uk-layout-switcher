@@ -37,6 +37,14 @@ static TYPED_BUFFER: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()
 static IS_CONVERTING: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 static LAST_ACTIVE_HWND: Lazy<Mutex<isize>> = Lazy::new(|| Mutex::new(0));
 
+// Стан для циклічної заміни (Loop)
+#[derive(Clone)]
+struct LastConversion {
+    pasted_text: String,
+    converted_to_ua: bool,
+}
+static LAST_CONVERSION: Lazy<Mutex<Option<LastConversion>>> = Lazy::new(|| Mutex::new(None));
+
 const MAX_BUFFER_LEN: usize = 100;
 // =========================
 
@@ -75,12 +83,27 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                 let shift = GetAsyncKeyState(VK_SHIFT.0 as i32) < 0;
                 
                 match vk {
-                    0x08 => { buffer.pop(); } // Backspace
-                    0x0D | 0x1B => buffer.clear(), // Return | Escape
-                    0x20 => buffer.push(' '), // Space
-                    0x09 => buffer.clear(), // Tab
-                    0x25 | 0x26 | 0x27 | 0x28 => buffer.clear(), // Arrows
-                    0x24 | 0x23 => buffer.clear(), // Home | End
+                    0x08 => { 
+                        buffer.pop(); 
+                        *LAST_CONVERSION.lock().unwrap() = None; // Скидаємо луп при редагуванні
+                    } // Backspace
+                    0x0D | 0x1B => { 
+                        buffer.clear(); 
+                        *LAST_CONVERSION.lock().unwrap() = None; // Скидаємо луп при Enter/Esc
+                    } // Return | Escape
+                    0x20 => buffer.push(' '), // Space (не скидаємо луп, щоб можна було циклити після пробілу)
+                    0x09 => { 
+                        buffer.clear(); 
+                        *LAST_CONVERSION.lock().unwrap() = None; 
+                    } // Tab
+                    0x25 | 0x26 | 0x27 | 0x28 => { 
+                        buffer.clear(); 
+                        *LAST_CONVERSION.lock().unwrap() = None; 
+                    } // Arrows
+                    0x24 | 0x23 => { 
+                        buffer.clear(); 
+                        *LAST_CONVERSION.lock().unwrap() = None; 
+                    } // Home | End
                     
                     // A-Z
                     v if (0x41..=0x5A).contains(&v) => {
@@ -135,6 +158,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         let msg = wparam.0 as u32;
         if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN {
             TYPED_BUFFER.lock().unwrap().clear();
+            *LAST_CONVERSION.lock().unwrap() = None; // Скидаємо луп при кліку миші
         }
     }
     CallNextHookEx(None, code, wparam, lparam)
@@ -150,14 +174,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- ІНІЦІАЛІЗАЦІЯ РІДНИХ ХУКІВ ---
-        // --- ІНІЦІАЛІЗАЦІЯ РІДНИХ ХУКІВ ---
     std::thread::spawn(|| {
         unsafe {
             let h_inst = GetModuleHandleW(None).unwrap();
             let kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), h_inst, 0);
             let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), h_inst, 0);
             
-            // ВИПРАВЛЕНО: перевірка помилок та розгортання Result
             if kb_hook.is_err() || mouse_hook.is_err() {
                 log_error("Не вдалося встановити системні хуки.");
                 return;
@@ -267,6 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if *last_hwnd == 0 { *last_hwnd = current_hwnd; } 
                 else if *last_hwnd != current_hwnd {
                     TYPED_BUFFER.lock().unwrap().clear();
+                    *LAST_CONVERSION.lock().unwrap() = None; // Скидаємо луп при зміні вікна
                     *last_hwnd = current_hwnd;
                 }
             }
@@ -466,6 +489,7 @@ fn toggle_layout_only(
     icon_en: &Icon,
     icon_ua: &Icon,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    *LAST_CONVERSION.lock().unwrap() = None; // Скидаємо луп при ручному перемиканні
     config.current_lang = get_current_os_lang();
     config.current_lang = if config.current_lang == "EN" { "UA" } else { "EN" }.to_string();
     switch_system_layout_silent(&config.current_lang);
@@ -473,6 +497,52 @@ fn toggle_layout_only(
     let _ = tray.set_icon(Some(if config.current_lang == "EN" { icon_en.clone() } else { icon_ua.clone() }));
     let _ = tray.set_tooltip(Some(&format!("UK Switcher — {}", config.current_lang)));
     let _ = save_config(config);
+    Ok(())
+}
+
+fn replace_text(
+    enigo: &mut Enigo, 
+    clipboard: &mut Clipboard, 
+    text_to_paste: &str, 
+    chars_to_delete: usize
+) -> Result<(), Box<dyn std::error::Error>> {
+    let saved_clipboard = clipboard.get_text().ok().filter(|s| !s.is_empty());
+    clipboard.set_text(text_to_paste)?;
+    thread::sleep(time::Duration::from_millis(30));
+
+    for _ in 0..chars_to_delete {
+        enigo.key(Key::Backspace, enigo::Direction::Press)?;
+        thread::sleep(time::Duration::from_millis(10));
+        enigo.key(Key::Backspace, enigo::Direction::Release)?;
+        thread::sleep(time::Duration::from_millis(10));
+    }
+    thread::sleep(time::Duration::from_millis(20));
+
+    enigo.key(Key::Control, enigo::Direction::Press)?;
+    thread::sleep(time::Duration::from_millis(10));
+    enigo.key(Key::V, enigo::Direction::Press)?;
+    thread::sleep(time::Duration::from_millis(5));
+    enigo.key(Key::V, enigo::Direction::Release)?;
+    thread::sleep(time::Duration::from_millis(5));
+    enigo.key(Key::Control, enigo::Direction::Release)?;
+    thread::sleep(time::Duration::from_millis(25));
+
+    spawn_clipboard_restore(saved_clipboard);
+    Ok(())
+}
+
+fn finalize_conversion(
+    config: &mut Config,
+    tray: &mut tray_icon::TrayIcon,
+    icon_en: &Icon,
+    icon_ua: &Icon,
+) -> Result<(), Box<dyn std::error::Error>> {
+    switch_system_layout_silent(&config.current_lang);
+    play_switch_sound(config);
+    let _ = tray.set_icon(Some(if config.current_lang == "EN" { icon_en.clone() } else { icon_ua.clone() }));
+    let _ = tray.set_tooltip(Some(&format!("UK Switcher — {}", config.current_lang)));
+    let _ = save_config(config);
+    thread::sleep(time::Duration::from_millis(50));
     Ok(())
 }
 
@@ -485,20 +555,12 @@ fn toggle_and_convert(
     let mut clipboard = Clipboard::new()?;
     let mut enigo = Enigo::new(&Settings::default())?;
 
-    // --- ДРУК БУФЕРУ В ЛОГ ---
-    //let buffer_content = TYPED_BUFFER.lock().unwrap().clone();
-    //log_error(&format!("--- НАТИСК CapsLock ---"));
-    //log_error(&format!("Вміст буфера: [{}]", buffer_content));
-
-    let last_word_data = get_last_word_from_buffer();
-    TYPED_BUFFER.lock().unwrap().clear();
-
     let original_os_lang = get_current_os_lang();
-    config.current_lang = if original_os_lang == "EN" { "UA" } else { "EN" }.to_string();
+    let last_word_data = get_last_word_from_buffer();
+    let last_conv = LAST_CONVERSION.lock().unwrap().clone();
 
+    // Сценарій 1: Конвертація нового слова з буфера
     if let Some((word, delete_count)) = last_word_data {
-        //log_error(&format!("Знайдено слово: [{}], Видалити символів: {}", word, delete_count));
-        
         if !word.is_empty() {
             let to_ua = original_os_lang == "EN";
             let mut converted = convert_text(&word, to_ua);
@@ -508,68 +570,75 @@ fn toggle_and_convert(
                 converted.push(' ');
             }
 
-            let saved_clipboard = clipboard.get_text().ok().filter(|s| !s.is_empty());
-            clipboard.set_text(&converted)?;
-            thread::sleep(time::Duration::from_millis(10));
-            thread::sleep(time::Duration::from_millis(20));
+            replace_text(&mut enigo, &mut clipboard, &converted, delete_count)?;
 
-            for _ in 0..delete_count {
-                enigo.key(Key::Backspace, enigo::Direction::Press)?;
-                thread::sleep(time::Duration::from_millis(10));
-                enigo.key(Key::Backspace, enigo::Direction::Release)?;
-                thread::sleep(time::Duration::from_millis(10));
-            }
-            thread::sleep(time::Duration::from_millis(20));
+            *LAST_CONVERSION.lock().unwrap() = Some(LastConversion {
+                pasted_text: converted.clone(),
+                converted_to_ua: to_ua,
+            });
 
-            enigo.key(Key::Control, enigo::Direction::Press)?;
-            thread::sleep(time::Duration::from_millis(10));
-            enigo.key(Key::V, enigo::Direction::Press)?;
-            thread::sleep(time::Duration::from_millis(5));
-            enigo.key(Key::V, enigo::Direction::Release)?;
-            thread::sleep(time::Duration::from_millis(5));
-            enigo.key(Key::Control, enigo::Direction::Release)?;
-            thread::sleep(time::Duration::from_millis(25));
-
-            spawn_clipboard_restore(saved_clipboard);
+            config.current_lang = if to_ua { "UA" } else { "EN" }.to_string();
+            finalize_conversion(config, tray, icon_en, icon_ua)?;
+            return Ok(());
         }
-    } else {
-        //log_error("Буфер порожній. Спроба конвертації виділеного тексту.");
-        
-        let marker = "___UK_SWITCHER_EMPTY_MARKER___";
-        let saved_clipboard = clipboard.get_text().ok().filter(|s| !s.is_empty());
-        
-        let _ = clipboard.set_text(marker);
-        thread::sleep(time::Duration::from_millis(10));
+    }
 
+    // Сценарій 2: Зациклення (Loop) останньої конвертації
+    if let Some(last) = last_conv {
+        let to_ua = !last.converted_to_ua;
+        let converted = convert_text(&last.pasted_text, to_ua);
+        let delete_count = last.pasted_text.chars().count();
+
+        replace_text(&mut enigo, &mut clipboard, &converted, delete_count)?;
+
+        *LAST_CONVERSION.lock().unwrap() = Some(LastConversion {
+            pasted_text: converted,
+            converted_to_ua: to_ua,
+        });
+
+        config.current_lang = if to_ua { "UA" } else { "EN" }.to_string();
+        finalize_conversion(config, tray, icon_en, icon_ua)?;
+        return Ok(());
+    }
+
+    // Сценарій 3: Конвертація виділеного тексту (Clipboard fallback)
+    let marker = "___UK_SWITCHER_EMPTY_MARKER___";
+    let saved_clipboard = clipboard.get_text().ok().filter(|s| !s.is_empty());
+    
+    let _ = clipboard.set_text(marker);
+    thread::sleep(time::Duration::from_millis(10));
+
+    enigo.key(Key::Control, enigo::Direction::Press)?;
+    enigo.key(Key::Insert, enigo::Direction::Click)?;
+    enigo.key(Key::Control, enigo::Direction::Release)?;
+    thread::sleep(time::Duration::from_millis(25));
+
+    let copied_text = clipboard.get_text().unwrap_or_default();
+
+    if !copied_text.is_empty() && copied_text != marker {
+        let cleaned_text = copied_text.trim_end_matches(|c| c == '\r' || c == '\n').to_string();
+        let to_ua = detect_conversion_direction(&cleaned_text);
+        let converted = convert_text(&cleaned_text, to_ua);
+        
+        let _ = clipboard.set_text(&converted)?;
         enigo.key(Key::Control, enigo::Direction::Press)?;
-        enigo.key(Key::Insert, enigo::Direction::Click)?;
+        enigo.key(Key::V, enigo::Direction::Click)?;
         enigo.key(Key::Control, enigo::Direction::Release)?;
         thread::sleep(time::Duration::from_millis(25));
 
-        let copied_text = clipboard.get_text().unwrap_or_default();
+        *LAST_CONVERSION.lock().unwrap() = Some(LastConversion {
+            pasted_text: converted,
+            converted_to_ua: to_ua,
+        });
 
-        if !copied_text.is_empty() && copied_text != marker {
-            let cleaned_text = copied_text.trim_end_matches(|c| c == '\r' || c == '\n').to_string();
-            let to_ua = detect_conversion_direction(&cleaned_text);
-            let converted = convert_text(&cleaned_text, to_ua);
-            
-            clipboard.set_text(&converted)?;
-            enigo.key(Key::Control, enigo::Direction::Press)?;
-            enigo.key(Key::V, enigo::Direction::Click)?;
-            enigo.key(Key::Control, enigo::Direction::Release)?;
-            thread::sleep(time::Duration::from_millis(25));
-        }
-
-        spawn_clipboard_restore(saved_clipboard);
+        config.current_lang = if to_ua { "UA" } else { "EN" }.to_string();
+    } else {
+        config.current_lang = if original_os_lang == "EN" { "UA" } else { "EN" }.to_string();
+        *LAST_CONVERSION.lock().unwrap() = None;
     }
 
-    switch_system_layout_silent(&config.current_lang);
-    play_switch_sound(config);
-    let _ = tray.set_icon(Some(if config.current_lang == "EN" { icon_en.clone() } else { icon_ua.clone() }));
-    let _ = tray.set_tooltip(Some(&format!("UK Switcher — {}", config.current_lang)));
-    let _ = save_config(config);
-    
-    thread::sleep(time::Duration::from_millis(50));
+    spawn_clipboard_restore(saved_clipboard);
+    finalize_conversion(config, tray, icon_en, icon_ua)?;
     Ok(())
 }
 

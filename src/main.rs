@@ -486,9 +486,9 @@ fn toggle_and_convert(
     let mut enigo = Enigo::new(&Settings::default())?;
 
     // --- ДРУК БУФЕРУ В ЛОГ ---
-    let buffer_content = TYPED_BUFFER.lock().unwrap().clone();
-    log_error(&format!("--- НАТИСК CapsLock ---"));
-    log_error(&format!("Вміст буфера: [{}]", buffer_content));
+    //let buffer_content = TYPED_BUFFER.lock().unwrap().clone();
+    //log_error(&format!("--- НАТИСК CapsLock ---"));
+    //log_error(&format!("Вміст буфера: [{}]", buffer_content));
 
     let last_word_data = get_last_word_from_buffer();
     TYPED_BUFFER.lock().unwrap().clear();
@@ -497,7 +497,7 @@ fn toggle_and_convert(
     config.current_lang = if original_os_lang == "EN" { "UA" } else { "EN" }.to_string();
 
     if let Some((word, delete_count)) = last_word_data {
-        log_error(&format!("Знайдено слово: [{}], Видалити символів: {}", word, delete_count));
+        //log_error(&format!("Знайдено слово: [{}], Видалити символів: {}", word, delete_count));
         
         if !word.is_empty() {
             let to_ua = original_os_lang == "EN";
@@ -533,7 +533,7 @@ fn toggle_and_convert(
             spawn_clipboard_restore(saved_clipboard);
         }
     } else {
-        log_error("Буфер порожній. Спроба конвертації виділеного тексту.");
+        //log_error("Буфер порожній. Спроба конвертації виділеного тексту.");
         
         let marker = "___UK_SWITCHER_EMPTY_MARKER___";
         let saved_clipboard = clipboard.get_text().ok().filter(|s| !s.is_empty());
